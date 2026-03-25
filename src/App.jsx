@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState } from "react";
 
 const C = {
   yellow: "#F5C518", amber: "#F0A030", darkAmber: "#E8901A",
@@ -10,25 +10,29 @@ const C = {
   blue: "#2563eb", blueBg: "#eff6ff", blueBorder: "#bfdbfe",
 };
 
-// ── HELPERS ─────────────────────────────────────────────
-function fmt(n) {
-  return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", minimumFractionDigits: 0 }).format(Math.abs(n));
-}
-
-async function siigoFetch(token, endpoint, params = {}) {
-  const qs = new URLSearchParams({ endpoint, ...params }).toString();
-  const res = await fetch(`/api/proxy?${qs}`, {
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
+// ── EXACTAMENTE IGUAL AL SIIGO-EXPLORER QUE FUNCIONA ────
+async function siigo(method, path, token, body, params) {
+  const p = new URLSearchParams({ endpoint: path, ...(params || {}) }).toString();
+  const url = `/api/proxy?${p}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
   });
-  return res.json();
+  const data = await res.json();
+  return { ok: res.ok, status: res.status, data };
 }
 
-async function fetchAll(token, endpoint, params = {}) {
+// Trae todos los registros del rango de fechas paginando automáticamente
+async function fetchAll(token, path, params) {
   let all = [], page = 1, total = 1;
   while (all.length < total) {
-    const data = await siigoFetch(token, endpoint, { ...params, page, page_size: 100 });
-    const results = data?.results || [];
-    total = data?.pagination?.total_results || results.length;
+    const r = await siigo("GET", path, token, null, { ...params, page, page_size: 100 });
+    const results = r.data?.results || [];
+    total = r.data?.pagination?.total_results || results.length;
     all = [...all, ...results];
     if (results.length < 100) break;
     page++;
@@ -36,50 +40,39 @@ async function fetchAll(token, endpoint, params = {}) {
   return all;
 }
 
-// ── ANÁLISIS M1-M5 ───────────────────────────────────────
+// ── ANÁLISIS M1 — CUENTAS DE BALANCE ───────────────────
 function analizarM1(journals) {
-  const balances = {};
+  const saldos = {};
   journals.forEach(j => {
     (j.items || []).forEach(item => {
       const code = item.account?.code || "";
       if (!code) return;
-      const grupo = code[0];
-      if (!balances[code]) balances[code] = { code, grupo, debits: 0, credits: 0, desc: item.description || "" };
-      if (item.account?.movement === "Debit") balances[code].debits += item.value || 0;
-      else balances[code].credits += item.value || 0;
+      if (!saldos[code]) saldos[code] = { code, grupo: code[0], debits: 0, credits: 0 };
+      if (item.account?.movement === "Debit") saldos[code].debits += item.value || 0;
+      else saldos[code].credits += item.value || 0;
     });
   });
 
-  const cuentas = Object.values(balances).map(c => ({
-    ...c,
-    saldo: c.debits - c.credits,
-    saldoAbs: Math.abs(c.debits - c.credits)
-  }));
-
-  // Cuentas de resultado (4,5,6,7) deben estar en cero al cierre
+  const cuentas = Object.values(saldos).map(c => ({ ...c, saldo: c.debits - c.credits }));
   const resultado = cuentas.filter(c => ["4","5","6","7"].includes(c.grupo));
   const noZero = resultado.filter(c => Math.abs(c.saldo) > 100);
-
-  // Saldos contrarios a naturaleza
-  const activos = cuentas.filter(c => ["1"].includes(c.grupo) && c.saldo < -100);
+  const activos = cuentas.filter(c => c.grupo === "1" && c.saldo < -100);
   const pasivos = cuentas.filter(c => ["2","3"].includes(c.grupo) && c.saldo > 100);
   const contrarios = [...activos, ...pasivos];
-
-  return { cuentas, resultado, noZero, contrarios, total: cuentas.length };
+  return { total: cuentas.length, noZero, contrarios };
 }
 
+// ── ANÁLISIS M2 — IMPUESTOS ─────────────────────────────
 function analizarM2(journals) {
-  const CUENTAS_IMP = {
+  const CTAS = {
     "2365": "ReteFuente por pagar",
     "2367": "ReteICA por pagar",
     "2368": "ReteIVA por pagar",
     "2408": "IVA por pagar",
     "2404": "ICA por pagar",
-    "2205": "IVA descontable",
   };
-
   const saldos = {};
-  Object.keys(CUENTAS_IMP).forEach(k => { saldos[k] = { debits: 0, credits: 0 }; });
+  Object.keys(CTAS).forEach(k => { saldos[k] = { debits: 0, credits: 0 }; });
 
   journals.forEach(j => {
     (j.items || []).forEach(item => {
@@ -91,64 +84,54 @@ function analizarM2(journals) {
     });
   });
 
-  const resultado = Object.entries(saldos).map(([code, v]) => ({
-    code,
-    nombre: CUENTAS_IMP[code],
-    saldo: v.credits - v.debits,
-    debits: v.debits,
-    credits: v.credits,
-    tieneMovimiento: v.debits > 0 || v.credits > 0,
+  const resultado = Object.entries(CTAS).map(([code, nombre]) => ({
+    code, nombre,
+    saldo: saldos[code].credits - saldos[code].debits,
+    tieneMovimiento: saldos[code].debits > 0 || saldos[code].credits > 0,
   }));
-
-  const iva = resultado.find(r => r.code === "2408");
   const alertas = resultado.filter(r => r.tieneMovimiento && r.saldo < 0);
-
-  return { resultado, iva, alertas };
+  return { resultado, alertas };
 }
 
+// ── ANÁLISIS M3 — ANTICIPOS VS CXP ─────────────────────
 function analizarM3(journals) {
   const ANTICIPOS = ["1330", "1120"];
   const CXP = ["2205", "2335", "2206"];
-
   const porTercero = {};
 
   journals.forEach(j => {
     (j.items || []).forEach(item => {
       const code = item.account?.code?.slice(0, 4) || "";
-      const tercero = item.customer?.identification || item.supplier?.identification || "SIN_TERCERO";
+      const tercero = item.customer?.identification || item.supplier?.identification || null;
+      if (!tercero) return;
       const val = item.value || 0;
-      const es_anticipo = ANTICIPOS.includes(code);
-      const es_cxp = CXP.includes(code);
-      if (!es_anticipo && !es_cxp) return;
-
-      if (!porTercero[tercero]) porTercero[tercero] = { tercero, anticipos: 0, cxp: 0, cuenta_anticipo: "", cuenta_cxp: "" };
-
-      if (es_anticipo) {
-        const mov = item.account?.movement;
-        porTercero[tercero].anticipos += mov === "Debit" ? val : -val;
-        porTercero[tercero].cuenta_anticipo = code;
-      }
-      if (es_cxp) {
-        const mov = item.account?.movement;
-        porTercero[tercero].cxp += mov === "Credit" ? val : -val;
-        porTercero[tercero].cuenta_cxp = code;
-      }
+      const esAnticipo = ANTICIPOS.includes(code);
+      const esCxp = CXP.includes(code);
+      if (!esAnticipo && !esCxp) return;
+      if (!porTercero[tercero]) porTercero[tercero] = { tercero, anticipos: 0, cxp: 0 };
+      if (esAnticipo) porTercero[tercero].anticipos += item.account?.movement === "Debit" ? val : -val;
+      if (esCxp) porTercero[tercero].cxp += item.account?.movement === "Credit" ? val : -val;
     });
   });
 
   const lista = Object.values(porTercero).filter(t => t.anticipos > 100 || t.cxp > 100);
   const neteables = lista.filter(t => t.anticipos > 100 && t.cxp > 100);
-  const anticiposSolos = lista.filter(t => t.anticipos > 100 && t.cxp <= 100);
-  const totalAnticipo = lista.reduce((s, t) => s + t.anticipos, 0);
+  const solos = lista.filter(t => t.anticipos > 100 && t.cxp <= 100);
   const totalNeto = neteables.reduce((s, t) => s + Math.min(t.anticipos, t.cxp), 0);
-
-  return { lista, neteables, anticiposSolos, totalAnticipo, totalNeto };
+  return { lista, neteables, solos, totalNeto };
 }
 
-function analizarM4(journals, pilaData) {
-  const NOMINA = { "2370": "Nómina por pagar", "2380": "Cesantías", "2610": "Prestaciones", "2620": "Pensiones", "2630": "Seguridad social" };
+// ── ANÁLISIS M4 — NÓMINA / PILA ────────────────────────
+function analizarM4(journals, totalPila) {
+  const CTAS = {
+    "2370": "Nómina por pagar",
+    "2380": "Cesantías",
+    "2610": "Prestaciones",
+    "2620": "Pensiones",
+    "2630": "Seguridad social",
+  };
   const saldos = {};
-  Object.keys(NOMINA).forEach(k => { saldos[k] = { debits: 0, credits: 0 }; });
+  Object.keys(CTAS).forEach(k => { saldos[k] = { debits: 0, credits: 0 }; });
 
   journals.forEach(j => {
     (j.items || []).forEach(item => {
@@ -160,142 +143,129 @@ function analizarM4(journals, pilaData) {
     });
   });
 
-  const resultado = Object.entries(saldos).map(([code, v]) => ({
-    code, nombre: NOMINA[code],
-    saldo: v.credits - v.debits,
-    tieneMovimiento: v.debits > 0 || v.credits > 0,
+  const resultado = Object.entries(CTAS).map(([code, nombre]) => ({
+    code, nombre,
+    saldo: saldos[code].credits - saldos[code].debits,
+    tieneMovimiento: saldos[code].debits > 0 || saldos[code].credits > 0,
   }));
 
-  const totalContable = resultado.reduce((s, r) => s + (r.tieneMovimiento ? r.saldo : 0), 0);
-  const diferencia = pilaData ? Math.abs(totalContable - pilaData.total) : null;
-  const pctDif = pilaData && pilaData.total > 0 ? (diferencia / pilaData.total) * 100 : null;
-
-  return { resultado, totalContable, diferencia, pctDif, tienePila: !!pilaData };
+  const totalContable = resultado.reduce((s, r) => s + (r.tieneMovimiento ? Math.max(r.saldo, 0) : 0), 0);
+  const diferencia = totalPila ? Math.abs(totalContable - totalPila) : null;
+  const pctDif = totalPila && totalPila > 0 ? (diferencia / totalPila) * 100 : null;
+  return { resultado, totalContable, diferencia, pctDif, tienePila: !!totalPila };
 }
 
+// ── ANÁLISIS M5 — PROVISIONES ──────────────────────────
 function analizarM5(journals) {
-  const PROVISIONES = {
-    "1592": { nombre: "Depreciación acumulada", tipo: "activo", pctMensual: null },
-    "2615": { nombre: "Vacaciones", tipo: "pasivo", pctMensual: 4.17 },
-    "2610": { nombre: "Prima de servicios", tipo: "pasivo", pctMensual: 8.33 },
-    "2620": { nombre: "Cesantías", tipo: "pasivo", pctMensual: 8.33 },
-    "2625": { nombre: "Intereses cesantías", tipo: "pasivo", pctMensual: 1.0 },
+  const CTAS = {
+    "1592": "Depreciación acumulada",
+    "2615": "Vacaciones",
+    "2610": "Prima de servicios",
+    "2620": "Cesantías",
+    "2625": "Intereses cesantías",
   };
-
-  const movimientos = {};
-  Object.keys(PROVISIONES).forEach(k => { movimientos[k] = { debits: 0, credits: 0, count: 0 }; });
+  const movs = {};
+  Object.keys(CTAS).forEach(k => { movs[k] = { debits: 0, credits: 0, count: 0 }; });
 
   journals.forEach(j => {
     (j.items || []).forEach(item => {
       const code = item.account?.code?.slice(0, 4) || "";
-      if (movimientos[code]) {
-        if (item.account?.movement === "Debit") movimientos[code].debits += item.value || 0;
-        else movimientos[code].credits += item.value || 0;
-        movimientos[code].count++;
+      if (movs[code]) {
+        if (item.account?.movement === "Debit") movs[code].debits += item.value || 0;
+        else movs[code].credits += item.value || 0;
+        movs[code].count++;
       }
     });
   });
 
-  const resultado = Object.entries(PROVISIONES).map(([code, meta]) => ({
-    code, ...meta,
-    debits: movimientos[code].debits,
-    credits: movimientos[code].credits,
-    count: movimientos[code].count,
-    tieneMovimiento: movimientos[code].count > 0,
-    saldo: movimientos[code].credits - movimientos[code].debits,
+  const resultado = Object.entries(CTAS).map(([code, nombre]) => ({
+    code, nombre,
+    saldo: movs[code].credits - movs[code].debits,
+    tieneMovimiento: movs[code].count > 0,
   }));
-
   const faltantes = resultado.filter(r => !r.tieneMovimiento);
-  const registradas = resultado.filter(r => r.tieneMovimiento);
-
-  return { resultado, faltantes, registradas };
+  return { resultado, faltantes };
 }
 
-// ── COMPONENTES UI ───────────────────────────────────────
+// ── HELPERS UI ──────────────────────────────────────────
+function fmt(n) {
+  return new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", minimumFractionDigits: 0 }).format(Math.abs(n || 0));
+}
+
 function JASLogo() {
   return (
-    <svg width="130" height="32" viewBox="0 0 130 36" fill="none">
+    <svg width="140" height="32" viewBox="0 0 140 36" fill="none">
       <circle cx="8" cy="28" r="5" fill="#F0A030"/>
       <rect x="17" y="16" width="8" height="18" rx="4" fill="#F0A030"/>
       <rect x="29" y="6" width="8" height="28" rx="4" fill="#F5C518"/>
       <text x="42" y="22" fontFamily="'Nunito',sans-serif" fontWeight="700" fontSize="18" fill="#1A1A1A" letterSpacing="2">JAS</text>
-      <text x="42" y="32" fontFamily="'Nunito',sans-serif" fontWeight="300" fontSize="7.5" fill="#4A4A4A">Control Contable</text>
+      <text x="42" y="32" fontFamily="'Nunito',sans-serif" fontWeight="300" fontSize="8" fill="#4A4A4A">Control Contable</text>
     </svg>
   );
 }
 
-function Semaforo({ estado }) {
+function Pill({ estado }) {
   const cfg = {
-    ok: { bg: C.greenBg, color: C.green, border: C.greenBorder, label: "✓ OK" },
-    alerta: { bg: C.redBg, color: C.red, border: C.redBorder, label: "⚠ Alerta" },
-    revisar: { bg: C.orangeBg, color: C.orange, border: C.orangeBorder, label: "Revisar" },
-    cargando: { bg: C.blueBg, color: C.blue, border: C.blueBorder, label: "Cargando..." },
-    pendiente: { bg: "#f9fafb", color: C.muted, border: "#e5e7eb", label: "Pendiente" },
+    ok:       { bg: C.greenBg,  color: C.green,  border: C.greenBorder,  label: "✓ OK" },
+    alerta:   { bg: C.redBg,    color: C.red,    border: C.redBorder,    label: "⚠ Alerta" },
+    revisar:  { bg: C.orangeBg, color: C.orange, border: C.orangeBorder, label: "Revisar" },
+    pendiente:{ bg: "#f9fafb",  color: C.muted,  border: "#e5e7eb",      label: "Pendiente" },
   };
   const s = cfg[estado] || cfg.pendiente;
   return <span style={{ background: s.bg, color: s.color, border: `1px solid ${s.border}`, fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 20 }}>{s.label}</span>;
 }
 
-function Card({ children, style }) {
-  return <div style={{ background: C.bgCard, border: `1.5px solid ${C.border}`, borderRadius: 12, ...style }}>{children}</div>;
-}
-
-function Section({ title, subtitle, estado, children, defaultOpen = false }) {
+function Module({ title, subtitle, estado, children, defaultOpen = false }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <Card style={{ marginBottom: 12, overflow: "hidden" }}>
-      <button onClick={() => setOpen(o => !o)} style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 18px", background: C.bgLight, border: "none", cursor: "pointer", fontFamily: "'Nunito',sans-serif", textAlign: "left" }}>
-        <div style={{ display: "flex", align: "center", gap: 10, alignItems: "center" }}>
-          <div>
-            <span style={{ fontSize: 14, fontWeight: 700, color: C.black }}>{title}</span>
-            {subtitle && <span style={{ fontSize: 12, color: C.muted, marginLeft: 8 }}>{subtitle}</span>}
-          </div>
-          {estado && <Semaforo estado={estado}/>}
+    <div style={{ border: `1.5px solid ${C.border}`, borderRadius: 12, marginBottom: 12, overflow: "hidden" }}>
+      <button onClick={() => setOpen(o => !o)} style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "13px 18px", background: C.bgLight, border: "none", cursor: "pointer", fontFamily: "'Nunito',sans-serif", textAlign: "left" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 14, fontWeight: 700, color: C.black }}>{title}</span>
+          {subtitle && <span style={{ fontSize: 12, color: C.muted }}>{subtitle}</span>}
+          {estado && <Pill estado={estado}/>}
         </div>
         <span style={{ color: C.muted, fontSize: 12 }}>{open ? "▲" : "▼"}</span>
       </button>
-      {open && <div style={{ padding: "16px 18px" }}>{children}</div>}
-    </Card>
+      {open && <div style={{ padding: "14px 18px", background: C.bgCard }}>{children}</div>}
+    </div>
   );
 }
 
-function Row({ label, hint, valor, estado, children }) {
+function CheckRow({ label, hint, valor, estado }) {
   return (
-    <div style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "10px 0", borderBottom: `1px solid ${C.border}` }}>
-      <div style={{ flex: 1 }}>
+    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, padding: "9px 0", borderBottom: `1px solid ${C.border}` }}>
+      <div>
         <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: C.black }}>{label}</p>
-        {hint && <p style={{ margin: 0, fontSize: 11, color: C.muted }}>{hint}</p>}
-        {children}
+        {hint && <p style={{ margin: 0, fontSize: 11, color: C.muted, marginTop: 2 }}>{hint}</p>}
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, marginTop: 2 }}>
-        {valor && <span style={{ fontSize: 12, fontWeight: 700, color: C.gray, fontFamily: "monospace" }}>{valor}</span>}
-        {estado && <Semaforo estado={estado}/>}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+        {valor && <span style={{ fontSize: 12, fontFamily: "monospace", color: C.gray }}>{valor}</span>}
+        {estado && <Pill estado={estado}/>}
       </div>
     </div>
   );
 }
 
-function AlertBox({ tipo, title, children }) {
+function Alerta({ tipo, title, children }) {
   const cfg = {
-    red: { bg: C.redBg, border: C.redBorder, color: C.red },
-    orange: { bg: C.orangeBg, border: C.orangeBorder, color: C.orange },
-    green: { bg: C.greenBg, border: C.greenBorder, color: C.green },
-    blue: { bg: C.blueBg, border: C.blueBorder, color: C.blue },
+    red:    { bg: C.redBg,    border: C.redBorder,    tc: C.red    },
+    orange: { bg: C.orangeBg, border: C.orangeBorder, tc: C.orange },
+    green:  { bg: C.greenBg,  border: C.greenBorder,  tc: C.green  },
+    blue:   { bg: C.blueBg,   border: C.blueBorder,   tc: C.blue   },
   };
   const s = cfg[tipo] || cfg.blue;
   return (
-    <div style={{ background: s.bg, border: `1px solid ${s.border}`, borderRadius: 8, padding: "10px 14px", margin: "10px 0 0", fontSize: 12 }}>
-      {title && <p style={{ fontWeight: 700, color: s.color, margin: "0 0 4px" }}>{title}</p>}
-      <div style={{ color: C.gray }}>{children}</div>
+    <div style={{ background: s.bg, border: `1px solid ${s.border}`, borderRadius: 8, padding: "10px 14px", marginTop: 12, fontSize: 12 }}>
+      {title && <p style={{ fontWeight: 700, color: s.tc, margin: "0 0 4px" }}>{title}</p>}
+      <span style={{ color: C.gray }}>{children}</span>
     </div>
   );
 }
 
-function inputSt(active) {
-  return { padding: "9px 12px", fontSize: 13, border: `1.5px solid ${active ? C.amber : C.border}`, borderRadius: 8, fontFamily: "'Nunito',sans-serif", fontWeight: 300, outline: "none", width: "100%", boxSizing: "border-box", background: C.bgCard };
-}
+const inputSt = { padding: "9px 12px", fontSize: 13, border: `1.5px solid ${C.border}`, borderRadius: 8, fontFamily: "'Nunito',sans-serif", fontWeight: 300, outline: "none", width: "100%", boxSizing: "border-box" };
 
-// ── APP PRINCIPAL ────────────────────────────────────────
+// ── APP ─────────────────────────────────────────────────
 export default function App() {
   const [creds, setCreds] = useState({ username: "", access_key: "" });
   const [token, setToken] = useState(null);
@@ -303,32 +273,36 @@ export default function App() {
   const [authMsg, setAuthMsg] = useState(null);
 
   const now = new Date();
-  const [periodo, setPeriodo] = useState({
-    inicio: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`,
-    fin: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()).padStart(2, "0")}`,
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const lastDay = new Date(y, now.getMonth() + 1, 0).getDate();
+
+  const [fechas, setFechas] = useState({
+    inicio: `${y}-${m}-01`,
+    fin: `${y}-${m}-${String(lastDay).padStart(2, "0")}`,
   });
 
+  const [pilaTotal, setPilaTotal] = useState("");
   const [analizando, setAnalizando] = useState(false);
   const [progreso, setProgreso] = useState("");
-  const [resultados, setResultados] = useState(null);
-  const [pilaInput, setPilaInput] = useState({ total: "", detalle: "" });
+  const [res, setRes] = useState(null);
 
+  // AUTENTICACIÓN — mismo patrón que siigo-explorer
   async function autenticar() {
     if (!creds.username || !creds.access_key) return;
     setAuthLoading(true);
     setAuthMsg(null);
     try {
-      const res = await fetch("/api/proxy?endpoint=v1/auth", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: creds.username, access_key: creds.access_key })
+      const r = await siigo("POST", "auth", null, {
+        username: creds.username,
+        access_key: creds.access_key,
       });
-      const data = await res.json();
-      if (data.access_token) {
-        setToken(data.access_token);
-        setAuthMsg({ ok: true, text: "✓ Conectado a Siigo. Configura el período y ejecuta el análisis." });
+      if (r.data?.access_token) {
+        setToken(r.data.access_token);
+        setAuthMsg({ ok: true, text: "✓ Conexión exitosa. Token válido por 24 horas." });
       } else {
-        setAuthMsg({ ok: false, text: data.Errors?.[0]?.Message || data.message || JSON.stringify(data) });
+        const msg = r.data?.Errors?.[0]?.Message || r.data?.message || r.data?.error || JSON.stringify(r.data);
+        setAuthMsg({ ok: false, text: msg });
       }
     } catch (e) {
       setAuthMsg({ ok: false, text: e.message });
@@ -336,73 +310,61 @@ export default function App() {
     setAuthLoading(false);
   }
 
-  async function ejecutarAnalisis() {
+  // ANÁLISIS COMPLETO
+  async function ejecutar() {
     if (!token) return;
     setAnalizando(true);
-    setResultados(null);
-
+    setRes(null);
     try {
-      setProgreso("Cargando comprobantes contables...");
+      setProgreso("Cargando comprobantes de diario...");
       const journals = await fetchAll(token, "v1/journals", {
-        created_start: periodo.inicio,
-        created_end: periodo.fin,
+        created_start: fechas.inicio,
+        created_end: fechas.fin,
       });
 
       setProgreso("Cargando facturas de compra...");
       const purchases = await fetchAll(token, "v1/purchases", {
-        created_start: periodo.inicio,
-        created_end: periodo.fin,
+        created_start: fechas.inicio,
+        created_end: fechas.fin,
       });
 
       setProgreso("Cargando facturas de venta...");
       const invoices = await fetchAll(token, "v1/invoices", {
-        date_start: periodo.inicio,
-        date_end: periodo.fin,
+        date_start: fechas.inicio,
+        date_end: fechas.fin,
       });
 
       setProgreso("Cargando recibos de caja...");
       const receipts = await fetchAll(token, "v1/vouchers", {
-        created_start: periodo.inicio,
-        created_end: periodo.fin,
+        created_start: fechas.inicio,
+        created_end: fechas.fin,
       });
 
-      setProgreso("Ejecutando módulos de control...");
-      const pilaData = pilaInput.total ? { total: parseFloat(pilaInput.total.replace(/[^0-9.]/g, "")) } : null;
+      setProgreso("Ejecutando módulos M1–M5...");
+      const pilaNum = pilaTotal ? parseFloat(pilaTotal.replace(/[^0-9.]/g, "")) : null;
 
-      const m1 = analizarM1(journals);
-      const m2 = analizarM2(journals);
-      const m3 = analizarM3(journals);
-      const m4 = analizarM4(journals, pilaData);
-      const m5 = analizarM5(journals);
-
-      setResultados({
-        journals, purchases, invoices, receipts,
-        m1, m2, m3, m4, m5,
-        periodo,
-        resumen: {
-          journals: journals.length,
-          purchases: purchases.length,
-          invoices: invoices.length,
-          receipts: receipts.length,
-        }
+      setRes({
+        counts: { journals: journals.length, purchases: purchases.length, invoices: invoices.length, receipts: receipts.length },
+        m1: analizarM1(journals),
+        m2: analizarM2(journals),
+        m3: analizarM3(journals),
+        m4: analizarM4(journals, pilaNum),
+        m5: analizarM5(journals),
       });
     } catch (e) {
-      setAuthMsg({ ok: false, text: "Error en análisis: " + e.message });
+      setAuthMsg({ ok: false, text: "Error: " + e.message });
     }
-
     setProgreso("");
     setAnalizando(false);
   }
 
-  const btnSt = (disabled) => ({
+  const btnSt = (dis) => ({
     padding: "10px 24px", fontSize: 13, fontWeight: 700,
-    background: disabled ? "#e5e7eb" : C.yellow,
-    color: disabled ? C.muted : C.black,
-    border: "none", borderRadius: 8, cursor: disabled ? "default" : "pointer",
-    fontFamily: "'Nunito',sans-serif", opacity: disabled ? 0.6 : 1,
+    background: dis ? "#e5e7eb" : C.yellow,
+    color: dis ? C.muted : C.black,
+    border: "none", borderRadius: 8, cursor: dis ? "default" : "pointer",
+    fontFamily: "'Nunito',sans-serif", opacity: dis ? 0.6 : 1,
   });
-
-  const r = resultados;
 
   return (
     <div style={{ minHeight: "100vh", background: C.bgPage, fontFamily: "'Nunito',sans-serif", fontWeight: 300, padding: "0 1rem 4rem" }}>
@@ -416,15 +378,15 @@ export default function App() {
         <div style={{ height: 3, background: `linear-gradient(90deg,${C.amber},${C.yellow},${C.amber})`, borderRadius: 2, margin: "0 0 20px" }}/>
 
         {/* Auth */}
-        <Section title="Autenticación" subtitle="Credenciales Siigo Nube" defaultOpen={!token}>
+        <Module title="Autenticación" subtitle="Credenciales Siigo Nube" defaultOpen={!token}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
             <div>
               <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 4 }}>Usuario API</label>
-              <input type="email" value={creds.username} onChange={e => setCreds(c => ({ ...c, username: e.target.value }))} placeholder="usuario@empresa.com" style={inputSt(creds.username)}/>
+              <input type="email" value={creds.username} onChange={e => setCreds(c => ({ ...c, username: e.target.value }))} placeholder="usuario@empresa.com" style={inputSt}/>
             </div>
             <div>
               <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 4 }}>Access Key</label>
-              <input type="password" value={creds.access_key} onChange={e => setCreds(c => ({ ...c, access_key: e.target.value }))} onKeyDown={e => e.key === "Enter" && autenticar()} style={inputSt(creds.access_key)}/>
+              <input type="password" value={creds.access_key} onChange={e => setCreds(c => ({ ...c, access_key: e.target.value }))} onKeyDown={e => e.key === "Enter" && autenticar()} style={inputSt}/>
             </div>
           </div>
           <button onClick={autenticar} disabled={authLoading || !creds.username || !creds.access_key} style={btnSt(authLoading || !creds.username || !creds.access_key)}>
@@ -435,42 +397,40 @@ export default function App() {
               {authMsg.text}
             </div>
           )}
-        </Section>
+        </Module>
 
         {token && (
           <>
-            {/* Período + Ejecutar */}
-            <Card style={{ padding: "16px 18px", marginBottom: 12 }}>
+            {/* Período */}
+            <div style={{ background: C.bgCard, border: `1.5px solid ${C.border}`, borderRadius: 12, padding: "16px 18px", marginBottom: 12 }}>
               <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 2, color: C.amber, marginBottom: 14 }}>Período de análisis</p>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, alignItems: "end" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
                 <div>
                   <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 4 }}>Fecha inicio</label>
-                  <input type="date" value={periodo.inicio} onChange={e => setPeriodo(p => ({ ...p, inicio: e.target.value }))} style={inputSt(true)}/>
+                  <input type="date" value={fechas.inicio} onChange={e => setFechas(f => ({ ...f, inicio: e.target.value }))} style={inputSt}/>
                 </div>
                 <div>
                   <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 4 }}>Fecha fin</label>
-                  <input type="date" value={periodo.fin} onChange={e => setPeriodo(p => ({ ...p, fin: e.target.value }))} style={inputSt(true)}/>
+                  <input type="date" value={fechas.fin} onChange={e => setFechas(f => ({ ...f, fin: e.target.value }))} style={inputSt}/>
                 </div>
-                <button onClick={ejecutarAnalisis} disabled={analizando} style={{ ...btnSt(analizando), width: "100%", padding: "10px 16px" }}>
-                  {analizando ? progreso || "Analizando..." : "▶ Ejecutar control"}
-                </button>
               </div>
-
-              {/* PILA input */}
-              <div style={{ marginTop: 14, padding: "12px 14px", background: C.bgLight, borderRadius: 8, border: `1px solid ${C.border}` }}>
-                <p style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>M4 — Total planilla PILA pagada del período (opcional)</p>
-                <input type="text" value={pilaInput.total} onChange={e => setPilaInput(p => ({ ...p, total: e.target.value }))} placeholder="Ej: 12480000" style={{ ...inputSt(pilaInput.total), width: 220 }}/>
+              <div style={{ background: C.bgLight, border: `1px solid ${C.border}`, borderRadius: 8, padding: "12px 14px", marginBottom: 14 }}>
+                <label style={{ fontSize: 11, color: C.muted, display: "block", marginBottom: 4 }}>M4 — Total planilla PILA pagada del período (opcional)</label>
+                <input type="text" value={pilaTotal} onChange={e => setPilaTotal(e.target.value)} placeholder="Ej: 12480000" style={{ ...inputSt, width: 220 }}/>
               </div>
-            </Card>
+              <button onClick={ejecutar} disabled={analizando} style={{ ...btnSt(analizando), width: "100%" }}>
+                {analizando ? (progreso || "Analizando...") : "▶ Ejecutar control M1–M5"}
+              </button>
+            </div>
 
-            {/* Resumen de datos cargados */}
-            {r && (
+            {/* Resumen de datos */}
+            {res && (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 20 }}>
                 {[
-                  ["Comprobantes", r.resumen.journals],
-                  ["Fact. compra", r.resumen.purchases],
-                  ["Fact. venta", r.resumen.invoices],
-                  ["Recibos caja", r.resumen.receipts],
+                  ["Comprobantes", res.counts.journals],
+                  ["Fact. compra", res.counts.purchases],
+                  ["Fact. venta", res.counts.invoices],
+                  ["Recibos caja", res.counts.receipts],
                 ].map(([label, val]) => (
                   <div key={label} style={{ background: C.bgLight, border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 14px", textAlign: "center" }}>
                     <p style={{ margin: 0, fontSize: 20, fontWeight: 700, color: C.black, fontFamily: "monospace" }}>{val.toLocaleString()}</p>
@@ -481,111 +441,101 @@ export default function App() {
             )}
 
             {/* M1 */}
-            {r && (
-              <Section
+            {res && (
+              <Module
                 title="M1 — Cuentas de balance"
-                subtitle="Verificación de cierre"
-                estado={r.m1.noZero.length === 0 && r.m1.contrarios.length === 0 ? "ok" : r.m1.contrarios.length > 0 ? "alerta" : "revisar"}
-                defaultOpen={r.m1.noZero.length > 0 || r.m1.contrarios.length > 0}
+                subtitle="Cierre de cuentas de resultado"
+                estado={res.m1.contrarios.length > 0 ? "alerta" : res.m1.noZero.length > 0 ? "revisar" : "ok"}
+                defaultOpen={res.m1.noZero.length > 0 || res.m1.contrarios.length > 0}
               >
-                <Row label="Cuentas analizadas" valor={`${r.m1.total}`} estado="ok"/>
-                <Row
-                  label="Cuentas de resultado sin cerrar (grupos 4,5,6,7)"
+                <CheckRow label="Cuentas analizadas" valor={String(res.m1.total)} estado="ok"/>
+                <CheckRow
+                  label="Cuentas de resultado sin cerrar (grupos 4, 5, 6, 7)"
                   hint="Deben estar en cero al cierre del período"
-                  valor={`${r.m1.noZero.length} cuentas`}
-                  estado={r.m1.noZero.length === 0 ? "ok" : "revisar"}
-                >
-                  {r.m1.noZero.length > 0 && (
-                    <div style={{ marginTop: 8 }}>
-                      {r.m1.noZero.slice(0, 10).map(c => (
-                        <div key={c.code} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, padding: "3px 0", borderBottom: `1px solid ${C.border}` }}>
-                          <span style={{ color: C.gray }}>Cta {c.code}</span>
-                          <span style={{ color: C.orange, fontFamily: "monospace" }}>{fmt(c.saldo)}</span>
-                        </div>
-                      ))}
-                      {r.m1.noZero.length > 10 && <p style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>...y {r.m1.noZero.length - 10} más</p>}
-                    </div>
-                  )}
-                </Row>
-                <Row
+                  valor={`${res.m1.noZero.length} cuentas`}
+                  estado={res.m1.noZero.length === 0 ? "ok" : "revisar"}
+                />
+                {res.m1.noZero.length > 0 && (
+                  <div style={{ marginTop: 8 }}>
+                    {res.m1.noZero.slice(0, 10).map(c => (
+                      <div key={c.code} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, padding: "4px 0", borderBottom: `1px solid ${C.border}` }}>
+                        <span style={{ color: C.gray }}>Cta {c.code} (grupo {c.grupo})</span>
+                        <span style={{ color: C.orange, fontFamily: "monospace" }}>{fmt(c.saldo)}</span>
+                      </div>
+                    ))}
+                    {res.m1.noZero.length > 10 && <p style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>...y {res.m1.noZero.length - 10} cuentas más</p>}
+                  </div>
+                )}
+                <CheckRow
                   label="Saldos contrarios a naturaleza"
-                  hint="Activos en crédito o pasivos en débito"
-                  valor={`${r.m1.contrarios.length} cuentas`}
-                  estado={r.m1.contrarios.length === 0 ? "ok" : "alerta"}
-                >
-                  {r.m1.contrarios.length > 0 && (
-                    <div style={{ marginTop: 8 }}>
-                      {r.m1.contrarios.slice(0, 8).map(c => (
-                        <div key={c.code} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, padding: "3px 0", borderBottom: `1px solid ${C.border}` }}>
-                          <span style={{ color: C.gray }}>Cta {c.code} (Grupo {c.grupo})</span>
-                          <span style={{ color: C.red, fontFamily: "monospace" }}>{fmt(c.saldo)}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </Row>
-                {r.m1.contrarios.length > 0 && (
-                  <AlertBox tipo="red" title="Saldos incorrectos detectados">
-                    Hay {r.m1.contrarios.length} cuentas con saldo contrario a su naturaleza. Revisar si son errores de codificación o asientos incompletos.
-                  </AlertBox>
+                  hint="Activos con saldo crédito · Pasivos con saldo débito"
+                  valor={`${res.m1.contrarios.length} cuentas`}
+                  estado={res.m1.contrarios.length === 0 ? "ok" : "alerta"}
+                />
+                {res.m1.contrarios.length > 0 && (
+                  <div style={{ marginTop: 8 }}>
+                    {res.m1.contrarios.slice(0, 8).map(c => (
+                      <div key={c.code} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, padding: "4px 0", borderBottom: `1px solid ${C.border}` }}>
+                        <span style={{ color: C.gray }}>Cta {c.code} (grupo {c.grupo})</span>
+                        <span style={{ color: C.red, fontFamily: "monospace" }}>{fmt(c.saldo)}</span>
+                      </div>
+                    ))}
+                    <Alerta tipo="red" title="Saldos incorrectos">
+                      Hay {res.m1.contrarios.length} cuenta(s) con saldo contrario a su naturaleza. Verificar si son errores de codificación o asientos incompletos.
+                    </Alerta>
+                  </div>
                 )}
-                {r.m1.noZero.length === 0 && r.m1.contrarios.length === 0 && (
-                  <AlertBox tipo="green" title="Balance en orden">
-                    Todas las cuentas de resultado cerraron correctamente y no hay saldos contrarios a la naturaleza.
-                  </AlertBox>
+                {res.m1.noZero.length === 0 && res.m1.contrarios.length === 0 && (
+                  <Alerta tipo="green" title="Balance en orden">Todas las cuentas de resultado cerraron correctamente. Sin saldos contrarios a la naturaleza.</Alerta>
                 )}
-              </Section>
+              </Module>
             )}
 
             {/* M2 */}
-            {r && (
-              <Section
+            {res && (
+              <Module
                 title="M2 — Control de impuestos"
-                subtitle="ReteFuente, ReteICA, ReteIVA, IVA, ICA"
-                estado={r.m2.alertas.length === 0 ? "ok" : "alerta"}
-                defaultOpen={r.m2.alertas.length > 0}
+                subtitle="ReteFuente · ReteICA · ReteIVA · IVA · ICA"
+                estado={res.m2.alertas.length === 0 ? "ok" : "alerta"}
+                defaultOpen={res.m2.alertas.length > 0}
               >
-                {r.m2.resultado.map(imp => (
-                  <Row
+                {res.m2.resultado.map(imp => (
+                  <CheckRow
                     key={imp.code}
                     label={`Cta ${imp.code} — ${imp.nombre}`}
-                    hint={imp.tieneMovimiento ? `Débitos: ${fmt(imp.debits)} · Créditos: ${fmt(imp.credits)}` : "Sin movimiento en el período"}
+                    hint={imp.tieneMovimiento ? "Con movimiento en el período" : "Sin movimiento en el período"}
                     valor={imp.tieneMovimiento ? fmt(imp.saldo) : "—"}
                     estado={!imp.tieneMovimiento ? "pendiente" : imp.saldo >= 0 ? "ok" : "alerta"}
                   />
                 ))}
-                {r.m2.alertas.length > 0 && (
-                  <AlertBox tipo="red" title={`${r.m2.alertas.length} cuenta(s) con saldo negativo`}>
-                    {r.m2.alertas.map(a => `Cta ${a.code} (${a.nombre}): ${fmt(a.saldo)}`).join(" · ")}. Verificar si hay retenciones sin contabilizar o notas de crédito pendientes.
-                  </AlertBox>
+                {res.m2.alertas.length > 0 ? (
+                  <Alerta tipo="red" title={`${res.m2.alertas.length} cuenta(s) con saldo negativo`}>
+                    {res.m2.alertas.map(a => `Cta ${a.code} (${a.nombre}): ${fmt(a.saldo)}`).join(" · ")}. Verificar retenciones sin contabilizar o notas de crédito pendientes.
+                  </Alerta>
+                ) : (
+                  <Alerta tipo="green" title="Impuestos en orden">Todas las cuentas de impuesto con saldo positivo. Sin alertas.</Alerta>
                 )}
-                {r.m2.alertas.length === 0 && r.m2.resultado.some(r => r.tieneMovimiento) && (
-                  <AlertBox tipo="green" title="Impuestos en orden">
-                    Todas las cuentas de impuesto tienen saldo positivo. Sin alertas.
-                  </AlertBox>
-                )}
-              </Section>
+              </Module>
             )}
 
             {/* M3 */}
-            {r && (
-              <Section
+            {res && (
+              <Module
                 title="M3 — Anticipos vs cuentas por pagar"
                 subtitle="Cruces posibles por tercero"
-                estado={r.m3.anticiposSolos.length > 0 ? "revisar" : r.m3.neteables.length > 0 ? "ok" : "ok"}
-                defaultOpen={r.m3.lista.length > 0}
+                estado={res.m3.solos.length > 0 ? "revisar" : res.m3.neteables.length > 0 ? "ok" : "ok"}
+                defaultOpen={res.m3.lista.length > 0}
               >
-                <Row label="Terceros con anticipo activo" valor={`${r.m3.lista.length}`} estado={r.m3.lista.length > 0 ? "revisar" : "ok"}/>
-                <Row label="Netos posibles (anticipo + CxP mismo tercero)" valor={`${r.m3.neteables.length} terceros`} estado={r.m3.neteables.length > 0 ? "ok" : "pendiente"}/>
-                <Row label="Total anticipo neto posible" valor={fmt(r.m3.totalNeto)} estado={r.m3.totalNeto > 0 ? "ok" : "pendiente"}/>
-
-                {r.m3.neteables.length > 0 && (
+                <CheckRow label="Terceros con anticipo activo" valor={String(res.m3.lista.length)} estado={res.m3.lista.length > 0 ? "revisar" : "ok"}/>
+                <CheckRow label="Netos posibles (anticipo + CxP mismo tercero)" valor={`${res.m3.neteables.length} terceros`} estado={res.m3.neteables.length > 0 ? "ok" : "pendiente"}/>
+                <CheckRow label="Total neto posible" valor={fmt(res.m3.totalNeto)} estado={res.m3.totalNeto > 0 ? "ok" : "pendiente"}/>
+                {res.m3.neteables.length > 0 && (
                   <div style={{ marginTop: 12 }}>
                     <p style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: C.muted, marginBottom: 8 }}>Terceros neteables</p>
-                    {r.m3.neteables.slice(0, 10).map(t => (
-                      <div key={t.tercero} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
+                    {res.m3.neteables.slice(0, 10).map(t => (
+                      <div key={t.tercero} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
                         <span style={{ color: C.gray }}>NIT {t.tercero}</span>
-                        <div style={{ display: "flex", gap: 12 }}>
+                        <div style={{ display: "flex", gap: 14 }}>
                           <span style={{ color: C.blue }}>Anticipo: {fmt(t.anticipos)}</span>
                           <span style={{ color: C.orange }}>CxP: {fmt(t.cxp)}</span>
                           <span style={{ color: C.green, fontWeight: 700 }}>Neto: {fmt(Math.min(t.anticipos, t.cxp))}</span>
@@ -594,123 +544,111 @@ export default function App() {
                     ))}
                   </div>
                 )}
-
-                {r.m3.anticiposSolos.length > 0 && (
-                  <AlertBox tipo="orange" title={`${r.m3.anticiposSolos.length} anticipos sin CxP correspondiente`}>
-                    Estos terceros tienen anticipo pero no tienen cuenta por pagar registrada. Verificar si hay entrega pendiente o si el anticipo debe reintegrarse.
-                  </AlertBox>
+                {res.m3.solos.length > 0 && (
+                  <Alerta tipo="orange" title={`${res.m3.solos.length} anticipos sin CxP correspondiente`}>
+                    Estos terceros tienen anticipo pero no CxP registrada. Verificar si hay entrega pendiente o si el anticipo debe reintegrarse.
+                  </Alerta>
                 )}
-                {r.m3.lista.length === 0 && (
-                  <AlertBox tipo="green" title="Sin anticipos pendientes">Sin anticipos activos en el período analizado.</AlertBox>
+                {res.m3.lista.length === 0 && (
+                  <Alerta tipo="green" title="Sin anticipos pendientes">Sin anticipos activos en el período analizado.</Alerta>
                 )}
-              </Section>
+              </Module>
             )}
 
             {/* M4 */}
-            {r && (
-              <Section
+            {res && (
+              <Module
                 title="M4 — Nómina y planilla PILA"
                 subtitle="Causación vs planilla pagada"
-                estado={!r.m4.tienePila ? "pendiente" : r.m4.pctDif < 1 ? "ok" : "alerta"}
+                estado={!res.m4.tienePila ? "pendiente" : res.m4.pctDif < 1 ? "ok" : "alerta"}
                 defaultOpen={true}
               >
-                {r.m4.resultado.map(nr => (
-                  <Row
+                {res.m4.resultado.map(nr => (
+                  <CheckRow
                     key={nr.code}
                     label={`Cta ${nr.code} — ${nr.nombre}`}
-                    hint={nr.tieneMovimiento ? `Saldo causado en el período` : "Sin movimiento"}
+                    hint={nr.tieneMovimiento ? "Con movimiento en el período" : "Sin movimiento"}
                     valor={nr.tieneMovimiento ? fmt(nr.saldo) : "—"}
                     estado={nr.tieneMovimiento ? "ok" : "pendiente"}
                   />
                 ))}
-                <Row
-                  label="Total causado en contabilidad"
-                  valor={fmt(r.m4.totalContable)}
-                  estado={r.m4.totalContable > 0 ? "ok" : "pendiente"}
-                />
-                {!r.m4.tienePila ? (
-                  <AlertBox tipo="blue" title="Ingresa el total de la planilla PILA">
-                    Para hacer el cruce completo, ingresa el valor total de la planilla PILA pagada en el campo de arriba y ejecuta el análisis nuevamente.
-                  </AlertBox>
+                <CheckRow label="Total causado en contabilidad" valor={fmt(res.m4.totalContable)} estado={res.m4.totalContable > 0 ? "ok" : "pendiente"}/>
+                {!res.m4.tienePila ? (
+                  <Alerta tipo="blue" title="Ingresa el total PILA para hacer el cruce">
+                    Escribe el valor total de la planilla PILA pagada en el campo de arriba y ejecuta el análisis nuevamente.
+                  </Alerta>
                 ) : (
                   <>
-                    <Row label="Total planilla PILA ingresada" valor={fmt(pilaInput.total)} estado="ok"/>
-                    <Row
-                      label="Diferencia PILA vs contabilidad"
-                      valor={fmt(r.m4.diferencia)}
-                      estado={r.m4.pctDif < 1 ? "ok" : "alerta"}
-                    />
-                    {r.m4.pctDif >= 1 ? (
-                      <AlertBox tipo="red" title={`Diferencia del ${r.m4.pctDif?.toFixed(2)}%`}>
-                        La diferencia supera el 1%. Verificar si hay empleados no incluidos en la planilla o causaciones incorrectas.
-                      </AlertBox>
+                    <CheckRow label="Total planilla PILA" valor={fmt(parseFloat(pilaTotal))} estado="ok"/>
+                    <CheckRow label="Diferencia" valor={fmt(res.m4.diferencia)} estado={res.m4.pctDif < 1 ? "ok" : "alerta"}/>
+                    {res.m4.pctDif >= 1 ? (
+                      <Alerta tipo="red" title={`Diferencia del ${res.m4.pctDif?.toFixed(2)}%`}>
+                        La diferencia supera el 1%. Verificar empleados no incluidos en la planilla o causaciones incorrectas.
+                      </Alerta>
                     ) : (
-                      <AlertBox tipo="green" title="Planilla PILA cuadra">La diferencia es menor al 1%. Nómina en orden.</AlertBox>
+                      <Alerta tipo="green" title="Planilla PILA cuadra">Diferencia menor al 1%. Nómina en orden.</Alerta>
                     )}
                   </>
                 )}
-              </Section>
+              </Module>
             )}
 
             {/* M5 */}
-            {r && (
-              <Section
+            {res && (
+              <Module
                 title="M5 — Provisiones"
-                subtitle="Depreciación, vacaciones, prima, cesantías"
-                estado={r.m5.faltantes.length === 0 ? "ok" : r.m5.faltantes.length >= 3 ? "alerta" : "revisar"}
-                defaultOpen={r.m5.faltantes.length > 0}
+                subtitle="Depreciación · Vacaciones · Prima · Cesantías"
+                estado={res.m5.faltantes.length === 0 ? "ok" : res.m5.faltantes.length >= 3 ? "alerta" : "revisar"}
+                defaultOpen={res.m5.faltantes.length > 0}
               >
-                {r.m5.resultado.map(p => (
-                  <Row
+                {res.m5.resultado.map(p => (
+                  <CheckRow
                     key={p.code}
                     label={`Cta ${p.code} — ${p.nombre}`}
-                    hint={p.tieneMovimiento
-                      ? `${p.count} movimiento(s) · Débitos: ${fmt(p.debits)} · Créditos: ${fmt(p.credits)}`
-                      : "Sin movimiento en el período"}
+                    hint={p.tieneMovimiento ? "Registrada en el período" : "Sin movimiento en el período"}
                     valor={p.tieneMovimiento ? fmt(p.saldo) : "—"}
                     estado={p.tieneMovimiento ? "ok" : "alerta"}
                   />
                 ))}
-                {r.m5.faltantes.length > 0 && (
-                  <AlertBox tipo="red" title={`${r.m5.faltantes.length} provisión(es) sin registrar`}>
-                    {r.m5.faltantes.map(f => `Cta ${f.code} — ${f.nombre}`).join(", ")}. Registrar antes de cerrar el período.
-                  </AlertBox>
-                )}
-                {r.m5.faltantes.length === 0 && (
-                  <AlertBox tipo="green" title="Todas las provisiones registradas">
+                {res.m5.faltantes.length > 0 ? (
+                  <Alerta tipo="red" title={`${res.m5.faltantes.length} provisión(es) sin registrar`}>
+                    {res.m5.faltantes.map(f => `${f.nombre} (Cta ${f.code})`).join(" · ")}. Registrar antes de cerrar el período.
+                  </Alerta>
+                ) : (
+                  <Alerta tipo="green" title="Todas las provisiones registradas">
                     Depreciación, vacaciones, prima, cesantías e intereses tienen movimiento en el período.
-                  </AlertBox>
+                  </Alerta>
                 )}
-              </Section>
+              </Module>
             )}
 
             {/* Resumen ejecutivo */}
-            {r && (
-              <Card style={{ padding: "16px 18px", marginTop: 8 }}>
-                <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 2, color: C.amber, marginBottom: 14 }}>Resumen ejecutivo del período</p>
+            {res && (
+              <div style={{ background: C.bgCard, border: `1.5px solid ${C.border}`, borderRadius: 12, padding: "16px 18px", marginTop: 8 }}>
+                <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 2, color: C.amber, marginBottom: 14 }}>Resumen ejecutivo</p>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                   {[
-                    ["M1 Balance", r.m1.noZero.length === 0 && r.m1.contrarios.length === 0 ? "ok" : r.m1.contrarios.length > 0 ? "alerta" : "revisar"],
-                    ["M2 Impuestos", r.m2.alertas.length === 0 ? "ok" : "alerta"],
-                    ["M3 Anticipos", r.m3.anticiposSolos.length > 0 ? "revisar" : "ok"],
-                    ["M4 PILA", !r.m4.tienePila ? "pendiente" : r.m4.pctDif < 1 ? "ok" : "alerta"],
-                    ["M5 Provisiones", r.m5.faltantes.length === 0 ? "ok" : r.m5.faltantes.length >= 3 ? "alerta" : "revisar"],
+                    ["M1 — Balance", res.m1.contrarios.length > 0 ? "alerta" : res.m1.noZero.length > 0 ? "revisar" : "ok"],
+                    ["M2 — Impuestos", res.m2.alertas.length === 0 ? "ok" : "alerta"],
+                    ["M3 — Anticipos", res.m3.solos.length > 0 ? "revisar" : "ok"],
+                    ["M4 — PILA", !res.m4.tienePila ? "pendiente" : res.m4.pctDif < 1 ? "ok" : "alerta"],
+                    ["M5 — Provisiones", res.m5.faltantes.length === 0 ? "ok" : res.m5.faltantes.length >= 3 ? "alerta" : "revisar"],
                   ].map(([label, estado]) => (
-                    <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", background: C.bgLight, borderRadius: 8, border: `1px solid ${C.border}` }}>
+                    <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 12px", background: C.bgLight, borderRadius: 8, border: `1px solid ${C.border}` }}>
                       <span style={{ fontSize: 13, fontWeight: 700, color: C.black }}>{label}</span>
-                      <Semaforo estado={estado}/>
+                      <Pill estado={estado}/>
                     </div>
                   ))}
                 </div>
-              </Card>
+              </div>
             )}
           </>
         )}
 
-        {!token && !authMsg && (
-          <div style={{ textAlign: "center", padding: "3rem", color: C.muted, fontSize: 13 }}>
+        {!token && (
+          <p style={{ textAlign: "center", padding: "3rem", color: C.muted, fontSize: 13 }}>
             Ingresa tus credenciales arriba para conectarte a Siigo y ejecutar el control contable.
-          </div>
+          </p>
         )}
       </div>
     </div>
